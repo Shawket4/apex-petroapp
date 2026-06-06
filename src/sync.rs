@@ -83,7 +83,8 @@ SELECT
     d.odo, 'PetroApp', d.petroapp_id, now(), now()
 FROM derived d
 ON CONFLICT (petroapp_bill_id) WHERE petroapp_bill_id IS NOT NULL DO NOTHING
-RETURNING car_no_plate, date, time, odometer_after, liters, fuel_rate, petroapp_bill_id
+RETURNING car_no_plate, date, "time" AS time, odometer_after,
+          liters::float8 AS liters, fuel_rate::float8 AS fuel_rate, petroapp_bill_id
 "#;
 
 /// Run one full sync cycle. `trigger` is "schedule" or "manual". This function is

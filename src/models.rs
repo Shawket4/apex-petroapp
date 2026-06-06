@@ -43,7 +43,7 @@ pub struct InsertedEvent {
     pub car_no_plate: String,
     pub date: String,
     pub time: String,
-    pub odometer_after: i32,
+    pub odometer_after: i64,
     pub liters: f64,
     pub fuel_rate: f64,
     pub petroapp_bill_id: i64,
