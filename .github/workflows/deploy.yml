@@ -1,188 +1,197 @@
-name: Build and Deploy apex-petroapp
+name: Build & Deploy apex-petroapp
 
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
 
+# Never let two deploys race; cancel an in-flight run when a newer push lands.
+concurrency:
+  group: deploy-apex-petroapp
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BIN: apex-petroapp
+  TARGET: x86_64-unknown-linux-musl
+  DEPLOY_DIR: /opt/apex-petroapp
+  SERVICE: apex-petroapp
+  HEALTH_PORT: "8090"
+
 jobs:
-  build-and-deploy:
+  build-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build in Docker (Ubuntu 22.04 - matches VPS)
-        env:
-          SQLX_OFFLINE: true
+      # Static musl build → a single self-contained binary that runs on ANY Linux,
+      # so we never have to match the VPS's glibc. This works precisely because the
+      # service uses rustls (no OpenSSL) and talks to Postgres over TCP (no libpq,
+      # no libsqlite). No Docker, no cross-compilation toolchain headaches.
+      - name: Install Rust + musl target
         run: |
-          cat > Dockerfile.build << 'EOF'
-          FROM ubuntu:22.04
+          rustup toolchain install stable --profile minimal
+          rustup target add "${TARGET}"
 
-          ENV DEBIAN_FRONTEND=noninteractive
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
 
-          RUN apt-get update && apt-get install -y \
-              curl \
-              build-essential \
-              pkg-config \
-              libssl-dev \
-              libsqlite3-dev \
-              ca-certificates \
-              && rm -rf /var/lib/apt/lists/*
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          ENV PATH="/root/.cargo/bin:${PATH}"
+      - name: Build (release, static)
+        run: cargo build --release --target "${TARGET}"
 
-          WORKDIR /app
-          COPY . .
-
-          RUN cargo build --release --verbose
-          RUN strip target/release/apex-petroapp || true
-          RUN ls -lh target/release/apex-petroapp
-          EOF
-
-          docker build -t apex-petroapp-builder -f Dockerfile.build .
-
-          docker create --name temp-container apex-petroapp-builder
-          docker cp temp-container:/app/target/release/apex-petroapp ./apex-petroapp
-          docker rm temp-container
-
-          ls -la apex-petroapp
-          file apex-petroapp
-          chmod +x apex-petroapp
-
-      - name: Prepare deployment package
+      - name: Verify the binary is static
         run: |
-          mkdir -p deployment
-
-          cp apex-petroapp deployment/
-          cp -r migrations deployment/ || true
-          # Ship .env.example but never the real .env
-          cp .env.example deployment/.env.example || true
-
-          tar -czf deployment.tar.gz -C deployment .
-
-          echo "Deployment package contents:"
-          tar -tzf deployment.tar.gz
+          BIN_PATH="target/${TARGET}/release/${BIN}"
+          strip "$BIN_PATH" || true
+          file "$BIN_PATH"
+          # Expect: "not a dynamic executable" — proves zero runtime lib deps.
+          ldd "$BIN_PATH" || true
+          ls -lh "$BIN_PATH"
+          cp "$BIN_PATH" "./${BIN}"
 
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          install -m 600 /dev/stdin ~/.ssh/deploy_key   <<< "${{ secrets.SSH_PRIVATE_KEY }}"
+          install -m 644 /dev/stdin ~/.ssh/known_hosts  <<< "${{ secrets.SSH_KNOWN_HOSTS }}"
 
-      - name: Deploy to VPS
+      - name: Upload binary
         run: |
-          cat > deploy.sh << 'EOF'
-          #!/bin/bash
-          set -e
+          scp -i ~/.ssh/deploy_key -P "${{ secrets.SSH_PORT }}" \
+            -o BatchMode=yes \
+            "./${BIN}" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/${BIN}.new"
 
-          DEPLOY_DIR="/opt/apex-petroapp"
-          SERVICE_NAME="apex-petroapp"
-          BACKUP_DIR="${DEPLOY_DIR}/backups"
-
-          echo "Starting apex-petroapp deployment..."
-
-          sudo mkdir -p "${DEPLOY_DIR}"
-          sudo mkdir -p "${BACKUP_DIR}"
-          sudo mkdir -p "${DEPLOY_DIR}/logs"
-
-          # ── Stop service ──────────────────────────────────────────────────
-          echo "Stopping service..."
-          sudo systemctl stop "${SERVICE_NAME}" || true
-
-          # ── Backup binary ─────────────────────────────────────────────────
-          if [ -f "${DEPLOY_DIR}/apex-petroapp" ]; then
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            echo "Backing up binary (${TIMESTAMP})..."
-            sudo cp "${DEPLOY_DIR}/apex-petroapp" "${BACKUP_DIR}/apex-petroapp.${TIMESTAMP}"
-            # Keep only the last 5 backups
-            sudo ls -t "${BACKUP_DIR}"/apex-petroapp.* 2>/dev/null | tail -n +6 | xargs -r sudo rm
+      # Optional: keep the production .env in a GitHub secret (PROD_ENV) so deploys
+      # are reproducible and you never edit it on the box. If the secret is empty,
+      # we leave the server's existing .env untouched.
+      - name: Upload production .env (only if PROD_ENV secret is set)
+        env:
+          PROD_ENV: ${{ secrets.PROD_ENV }}
+        run: |
+          if [ -n "$PROD_ENV" ]; then
+            printf '%s' "$PROD_ENV" > prod.env
+            scp -i ~/.ssh/deploy_key -P "${{ secrets.SSH_PORT }}" -o BatchMode=yes \
+              prod.env "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/${BIN}.env.new"
+            rm -f prod.env
+            echo "Uploaded production .env from secret."
+          else
+            echo "PROD_ENV not set — server .env will be left as-is."
           fi
 
-          # ── Extract new files ─────────────────────────────────────────────
-          echo "Extracting deployment package..."
-          sudo tar -xzf /tmp/petroapp-deployment.tar.gz -C "${DEPLOY_DIR}"
+      - name: Deploy
+        run: |
+          # Remote deploy script. 'REOF' (quoted) prevents local variable expansion;
+          # config is passed as a small env preamble on the ssh command line.
+          cat > deploy_remote.sh <<'REOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
 
-          sudo chmod +x "${DEPLOY_DIR}/apex-petroapp"
-          sudo chown -R root:root "${DEPLOY_DIR}"
+          RUN_USER="apex"
+          NEW_BIN="/tmp/${BIN}.new"
+          NEW_ENV="/tmp/${BIN}.env.new"
 
-          # ── Bootstrap .env if missing ─────────────────────────────────────
-          if [ ! -f "${DEPLOY_DIR}/.env" ]; then
-            if [ -f "${DEPLOY_DIR}/.env.example" ]; then
-              echo "Creating .env from .env.example — edit before restarting if needed"
-              sudo cp "${DEPLOY_DIR}/.env.example" "${DEPLOY_DIR}/.env"
-            else
-              echo "⚠️  No .env found — service may fail to start"
-            fi
-          else
-            echo ".env already exists, leaving untouched"
+          echo "==> Deploying ${SERVICE} to ${DEPLOY_DIR}"
+
+          # Dedicated unprivileged service account.
+          if ! id -u "${RUN_USER}" >/dev/null 2>&1; then
+            sudo useradd --system --no-create-home --shell /usr/sbin/nologin "${RUN_USER}"
           fi
 
-          # ── Restart service ───────────────────────────────────────────────
-          echo "Restarting service..."
-          sudo systemctl daemon-reload
-          sudo systemctl enable "${SERVICE_NAME}"
-          sudo systemctl restart "${SERVICE_NAME}"
+          sudo mkdir -p "${DEPLOY_DIR}" "${DEPLOY_DIR}/backups"
 
-          sleep 3
+          # Install/refresh the systemd unit (idempotent). The binary loads
+          # ${DEPLOY_DIR}/.env itself via dotenv, so WorkingDirectory is all it needs.
+          sudo tee "/etc/systemd/system/${SERVICE}.service" >/dev/null <<UNIT
+          [Unit]
+          Description=Apex PetroApp microservice
+          After=network-online.target postgresql.service
+          Wants=network-online.target
 
-          if sudo systemctl is-active --quiet "${SERVICE_NAME}"; then
-            echo "✅ Service is running"
-            sudo systemctl status "${SERVICE_NAME}" --no-pager
-          else
-            echo "❌ Service failed to start — last 30 log lines:"
-            sudo journalctl -u "${SERVICE_NAME}" -n 30 --no-pager
+          [Service]
+          Type=simple
+          User=${RUN_USER}
+          Group=${RUN_USER}
+          WorkingDirectory=${DEPLOY_DIR}
+          ExecStart=${DEPLOY_DIR}/${BIN}
+          Restart=on-failure
+          RestartSec=5
+          NoNewPrivileges=true
+          ProtectSystem=full
+          ProtectHome=true
+          PrivateTmp=true
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          # Stop before swapping the binary.
+          sudo systemctl stop "${SERVICE}" 2>/dev/null || true
+
+          # Back up the current binary; keep the last 5.
+          if [ -f "${DEPLOY_DIR}/${BIN}" ]; then
+            ts="$(date +%Y%m%d_%H%M%S)"
+            sudo cp "${DEPLOY_DIR}/${BIN}" "${DEPLOY_DIR}/backups/${BIN}.${ts}"
+            ls -t "${DEPLOY_DIR}/backups/${BIN}."* 2>/dev/null | tail -n +6 | xargs -r sudo rm -f
+          fi
+
+          # Install the new binary atomically.
+          test -f "${NEW_BIN}"
+          sudo install -m 0755 "${NEW_BIN}" "${DEPLOY_DIR}/${BIN}"
+          sudo rm -f "${NEW_BIN}"
+
+          # Production env: prefer an uploaded one; otherwise require an existing .env.
+          # We never seed placeholder values that would start the service misconfigured.
+          if [ -f "${NEW_ENV}" ]; then
+            sudo install -m 0600 "${NEW_ENV}" "${DEPLOY_DIR}/.env"
+            sudo rm -f "${NEW_ENV}"
+            echo "Installed .env from PROD_ENV secret."
+          elif [ ! -f "${DEPLOY_DIR}/.env" ]; then
+            echo "ERROR: ${DEPLOY_DIR}/.env is missing and no PROD_ENV secret was provided."
+            echo "Create it (DATABASE_URL, INTERNAL_API_KEY, WhatsApp vars, ...) and re-run."
             exit 1
           fi
 
-          echo "Deployment complete!"
-          EOF
+          sudo chown -R "${RUN_USER}:${RUN_USER}" "${DEPLOY_DIR}"
+          sudo chmod 0600 "${DEPLOY_DIR}/.env"
 
-          chmod +x deploy.sh
+          sudo systemctl daemon-reload
+          sudo systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
+          sudo systemctl restart "${SERVICE}"
 
-          echo "Uploading deployment package..."
-          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
-            deployment.tar.gz \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/petroapp-deployment.tar.gz
+          # Health gate: poll /health and FAIL the deploy if it never comes up.
+          echo "==> Waiting for health on 127.0.0.1:${HEALTH_PORT}/health"
+          ok=0
+          for _ in $(seq 1 15); do
+            if curl -sf "http://127.0.0.1:${HEALTH_PORT}/health" >/dev/null; then ok=1; break; fi
+            sleep 2
+          done
 
-          echo "Uploading deploy script..."
-          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
-            deploy.sh \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/petroapp-deploy.sh
+          if [ "$ok" = "1" ]; then
+            echo "✅ ${SERVICE} is healthy"
+            sudo systemctl status "${SERVICE}" --no-pager || true
+          else
+            echo "❌ ${SERVICE} did not become healthy — recent logs:"
+            sudo journalctl -u "${SERVICE}" -n 40 --no-pager || true
+            exit 1
+          fi
+          REOF
 
-          echo "Running deploy script on VPS..."
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "bash /tmp/petroapp-deploy.sh"
+          scp -i ~/.ssh/deploy_key -P "${{ secrets.SSH_PORT }}" -o BatchMode=yes \
+            deploy_remote.sh \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/${BIN}-deploy.sh"
 
-      - name: Health check
-        run: |
-          echo "Waiting for service to be ready..."
-          sleep 5
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "curl -sf http://127.0.0.1:8090/health && echo '✅ healthy' || echo '⚠️ health endpoint not available'"
+          ssh -i ~/.ssh/deploy_key -p "${{ secrets.SSH_PORT }}" -o BatchMode=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "BIN='${BIN}' SERVICE='${SERVICE}' DEPLOY_DIR='${DEPLOY_DIR}' HEALTH_PORT='${HEALTH_PORT}' bash /tmp/${BIN}-deploy.sh"
 
-      - name: Verify deployment
-        run: |
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "systemctl status apex-petroapp --no-pager" || true
-
-      - name: Show recent logs
+      - name: Cleanup SSH key
         if: always()
-        run: |
-          echo "Recent service logs:"
-          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "sudo journalctl -u apex-petroapp -n 30 --no-pager" || true
-
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -f ~/.ssh/deploy_key
-          echo "Cleaned up SSH keys"
+        run: rm -f ~/.ssh/deploy_key
