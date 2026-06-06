@@ -1,0 +1,188 @@
+name: Build and Deploy apex-petroapp
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build in Docker (Ubuntu 22.04 - matches VPS)
+        env:
+          SQLX_OFFLINE: true
+        run: |
+          cat > Dockerfile.build << 'EOF'
+          FROM ubuntu:22.04
+
+          ENV DEBIAN_FRONTEND=noninteractive
+
+          RUN apt-get update && apt-get install -y \
+              curl \
+              build-essential \
+              pkg-config \
+              libssl-dev \
+              libsqlite3-dev \
+              ca-certificates \
+              && rm -rf /var/lib/apt/lists/*
+
+          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          ENV PATH="/root/.cargo/bin:${PATH}"
+
+          WORKDIR /app
+          COPY . .
+
+          RUN cargo build --release --verbose
+          RUN strip target/release/apex-petroapp || true
+          RUN ls -lh target/release/apex-petroapp
+          EOF
+
+          docker build -t apex-petroapp-builder -f Dockerfile.build .
+
+          docker create --name temp-container apex-petroapp-builder
+          docker cp temp-container:/app/target/release/apex-petroapp ./apex-petroapp
+          docker rm temp-container
+
+          ls -la apex-petroapp
+          file apex-petroapp
+          chmod +x apex-petroapp
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deployment
+
+          cp apex-petroapp deployment/
+          cp -r migrations deployment/ || true
+          # Ship .env.example but never the real .env
+          cp .env.example deployment/.env.example || true
+
+          tar -czf deployment.tar.gz -C deployment .
+
+          echo "Deployment package contents:"
+          tar -tzf deployment.tar.gz
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy to VPS
+        run: |
+          cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          DEPLOY_DIR="/opt/apex-petroapp"
+          SERVICE_NAME="apex-petroapp"
+          BACKUP_DIR="${DEPLOY_DIR}/backups"
+
+          echo "Starting apex-petroapp deployment..."
+
+          sudo mkdir -p "${DEPLOY_DIR}"
+          sudo mkdir -p "${BACKUP_DIR}"
+          sudo mkdir -p "${DEPLOY_DIR}/logs"
+
+          # ── Stop service ──────────────────────────────────────────────────
+          echo "Stopping service..."
+          sudo systemctl stop "${SERVICE_NAME}" || true
+
+          # ── Backup binary ─────────────────────────────────────────────────
+          if [ -f "${DEPLOY_DIR}/apex-petroapp" ]; then
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            echo "Backing up binary (${TIMESTAMP})..."
+            sudo cp "${DEPLOY_DIR}/apex-petroapp" "${BACKUP_DIR}/apex-petroapp.${TIMESTAMP}"
+            # Keep only the last 5 backups
+            sudo ls -t "${BACKUP_DIR}"/apex-petroapp.* 2>/dev/null | tail -n +6 | xargs -r sudo rm
+          fi
+
+          # ── Extract new files ─────────────────────────────────────────────
+          echo "Extracting deployment package..."
+          sudo tar -xzf /tmp/petroapp-deployment.tar.gz -C "${DEPLOY_DIR}"
+
+          sudo chmod +x "${DEPLOY_DIR}/apex-petroapp"
+          sudo chown -R root:root "${DEPLOY_DIR}"
+
+          # ── Bootstrap .env if missing ─────────────────────────────────────
+          if [ ! -f "${DEPLOY_DIR}/.env" ]; then
+            if [ -f "${DEPLOY_DIR}/.env.example" ]; then
+              echo "Creating .env from .env.example — edit before restarting if needed"
+              sudo cp "${DEPLOY_DIR}/.env.example" "${DEPLOY_DIR}/.env"
+            else
+              echo "⚠️  No .env found — service may fail to start"
+            fi
+          else
+            echo ".env already exists, leaving untouched"
+          fi
+
+          # ── Restart service ───────────────────────────────────────────────
+          echo "Restarting service..."
+          sudo systemctl daemon-reload
+          sudo systemctl enable "${SERVICE_NAME}"
+          sudo systemctl restart "${SERVICE_NAME}"
+
+          sleep 3
+
+          if sudo systemctl is-active --quiet "${SERVICE_NAME}"; then
+            echo "✅ Service is running"
+            sudo systemctl status "${SERVICE_NAME}" --no-pager
+          else
+            echo "❌ Service failed to start — last 30 log lines:"
+            sudo journalctl -u "${SERVICE_NAME}" -n 30 --no-pager
+            exit 1
+          fi
+
+          echo "Deployment complete!"
+          EOF
+
+          chmod +x deploy.sh
+
+          echo "Uploading deployment package..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            deployment.tar.gz \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/petroapp-deployment.tar.gz
+
+          echo "Uploading deploy script..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            deploy.sh \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/petroapp-deploy.sh
+
+          echo "Running deploy script on VPS..."
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "bash /tmp/petroapp-deploy.sh"
+
+      - name: Health check
+        run: |
+          echo "Waiting for service to be ready..."
+          sleep 5
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "curl -sf http://127.0.0.1:8090/health && echo '✅ healthy' || echo '⚠️ health endpoint not available'"
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "systemctl status apex-petroapp --no-pager" || true
+
+      - name: Show recent logs
+        if: always()
+        run: |
+          echo "Recent service logs:"
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo journalctl -u apex-petroapp -n 30 --no-pager" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+          echo "Cleaned up SSH keys"
