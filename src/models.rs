@@ -41,11 +41,15 @@ pub struct SyncRun {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct InsertedEvent {
     pub car_no_plate: String,
+    pub driver_name: String,
     pub date: String,
     pub time: String,
     pub odometer_after: i64,
     pub liters: f64,
+    pub price: f64,
+    pub price_per_liter: f64,
     pub fuel_rate: f64,
+    pub transporter: String,
     pub petroapp_bill_id: i64,
 }
 

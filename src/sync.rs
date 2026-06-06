@@ -83,8 +83,9 @@ SELECT
     d.odo, 'PetroApp', d.petroapp_id, now(), now()
 FROM derived d
 ON CONFLICT (petroapp_bill_id) WHERE petroapp_bill_id IS NOT NULL DO NOTHING
-RETURNING car_no_plate, date, "time" AS time, odometer_after,
-          liters::float8 AS liters, fuel_rate::float8 AS fuel_rate, petroapp_bill_id
+RETURNING car_no_plate, driver_name, date, "time" AS time, odometer_after,
+          liters::float8 AS liters, price::float8 AS price, price_per_liter::float8 AS price_per_liter, 
+          fuel_rate::float8 AS fuel_rate, transporter, petroapp_bill_id
 "#;
 
 /// Run one full sync cycle. `trigger` is "schedule" or "manual". This function is
@@ -419,20 +420,35 @@ async fn notify_results(state: &AppState, inserted: &[InsertedEvent]) -> i32 {
         let flag = if ev.fuel_rate <= 0.0 {
             " (no baseline yet)"
         } else if ev.fuel_rate < cfg.anomaly_rate_min {
-            " ⚠️ LOW efficiency"
+            "\n🚨 *LOW EFFICIENCY ALERT* - Below normal range"
         } else if ev.fuel_rate > cfg.anomaly_rate_max {
-            " ⚠️ HIGH efficiency"
+            "\n⚠️ *HIGH EFFICIENCY ALERT* - Above normal range"
         } else {
-            ""
+            "\n✅ *Normal fuel efficiency*"
         };
         let msg = format!(
-            "⛽ {plate}\n{date} {time}\nLiters: {liters:.2}\nOdometer: {odo}\nEfficiency: {rate:.2} km/L{flag}",
+            "🚛 *FUEL EVENT NOTIFICATION*\n\n\
+             *Vehicle:* {plate}\n\
+             *Driver:* {driver}\n\
+             *Date:* {date}\n\
+             *Time:* {time}\n\n\
+             ⛽ *Fuel Details:*\n\
+             - Amount: {liters:.2} L\n\
+             - Cost: {price:.2} EGP\n\
+             - Price/L: {ppl:.2} EGP\n\
+             - Odometer: {odo}\n\
+             - Efficiency: {rate:.2} km/L\n\n\
+             🏪 *Station:* {station}\n{flag}",
             plate = ev.car_no_plate,
+            driver = ev.driver_name,
             date = ev.date,
             time = ev.time,
             liters = ev.liters,
+            price = ev.price,
+            ppl = ev.price_per_liter,
             odo = ev.odometer_after,
             rate = ev.fuel_rate,
+            station = ev.transporter,
             flag = flag,
         );
         notify::whatsapp(cfg, &state.http, &msg).await;
