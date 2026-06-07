@@ -221,7 +221,7 @@ async fn run_inner(state: &AppState, run_id: i64) -> Result<SyncOutcome, SyncErr
     land_raw_bills(pool, &bills.bills).await?;
 
     // 4. Convert unprocessed -> fuel_events, returning the freshly inserted ones.
-    let inserted: Vec<InsertedEvent> = sqlx::query_as::<_, InsertedEvent>(CONVERT_SQL)
+    let mut inserted: Vec<InsertedEvent> = sqlx::query_as::<_, InsertedEvent>(CONVERT_SQL)
         .fetch_all(pool)
         .await?;
     let bill_ids: Vec<i64> = inserted.iter().map(|e| e.petroapp_bill_id).collect();
@@ -285,6 +285,20 @@ async fn run_inner(state: &AppState, run_id: i64) -> Result<SyncOutcome, SyncErr
         //     the values the operator gave them. Ordering matches the baseline
         //     lookup (date, then odometer_after) to avoid AM/PM time-string sorting.
         recompute_chain(pool, &bill_ids).await?;
+
+        // Re-fetch the fully calculated fuel_rate from the database so notifications
+        // broadcast the final, correct efficiency rather than the pre-recompute one.
+        for ev in &mut inserted {
+            if let Ok(Some(rate)) = sqlx::query_scalar::<_, f64>(
+                "SELECT fuel_rate::float8 FROM fuel_events WHERE petroapp_bill_id = $1"
+            )
+            .bind(ev.petroapp_bill_id)
+            .fetch_optional(pool)
+            .await
+            {
+                ev.fuel_rate = rate;
+            }
+        }
     }
 
     // 7. Notifications.
