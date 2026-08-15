@@ -189,21 +189,11 @@ async fn run_inner(state: &AppState, run_id: i64) -> Result<SyncOutcome, SyncErr
     .await?;
     let creds = creds.ok_or_else(|| SyncError::Other("no PetroApp credentials configured".into()))?;
 
-    // 2. Determine the fetch window: from (latest stored bill date − 1 day) through
-    //    today, so we always re-cover the most recent day to be safe and never
-    //    miss a gap. Falls back to the configured lookback when there's no history.
-    let last_date: Option<chrono::NaiveDateTime> = sqlx::query_scalar(
-        r#"SELECT max((payload->>'date')::timestamp)
-           FROM petroapp_raw_bills
-           WHERE payload->>'date' ~ '^\d{4}-\d{2}-\d{2}'"#,
-    )
-    .fetch_one(pool)
-    .await?;
-
-    let start = match last_date {
-        Some(d) => d.date() - chrono::Duration::days(1),
-        None => Utc::now().date_naive() - chrono::Duration::days(cfg.sync_lookback_days),
-    };
+    // 2. Determine the fetch window: always the last 7 days through today, so the
+    //    service self-heals after downtime — bills already landed are deduped by
+    //    petroapp_id, and any missed during an outage get picked up on the next run.
+    //    A larger configured lookback (used for the initial backfill) still wins.
+    let start = Utc::now().date_naive() - chrono::Duration::days(cfg.sync_lookback_days.max(7));
 
     // Fetch bills (paginated). Auth failures propagate to the caller's handler.
     let bills = state.petro.fetch_bills(&creds, start).await?;
