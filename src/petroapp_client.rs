@@ -14,8 +14,10 @@ use crate::models::Credentials;
 pub const FIELD_ID: &str = "id";
 pub const FIELD_VEHICLE_PLATE: &str = "vehicle";
 
-/// Date format used in the `dates=START-END` query parameter.
-const DATE_FMT: &str = "%Y-%m-%d";
+/// Date format used in the `dates=` query parameter. The API only honors
+/// `MM/DD/YYYY - MM/DD/YYYY` (URL-encoded); any other shape is silently
+/// ignored and the endpoint falls back to returning today's bills only.
+const DATE_FMT: &str = "%m/%d/%Y";
 
 #[derive(Clone)]
 pub struct PetroClient {
@@ -51,7 +53,8 @@ impl PetroClient {
         start: chrono::NaiveDate,
     ) -> Result<BillsResult, PetroError> {
         let end = Utc::now().date_naive();
-        let dates = format!("{}-{}", start.format(DATE_FMT), end.format(DATE_FMT));
+        let dates = format!("{}%20-%20{}", start.format(DATE_FMT), end.format(DATE_FMT))
+            .replace('/', "%2F");
 
         let mut bills = Vec::new();
         let mut page: u32 = 1;
