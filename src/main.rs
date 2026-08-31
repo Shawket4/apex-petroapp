@@ -7,6 +7,7 @@ mod config;
 mod db;
 mod error;
 mod models;
+mod observability;
 mod notify;
 mod petroapp_client;
 mod scheduler;
@@ -33,6 +34,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Sentry, if SENTRY_DSN is set. The guard must outlive the server; with no
+    // DSN this is None and the service runs exactly as it did before.
+    let _sentry = observability::init();
+
     let cfg = Config::from_env()?;
     let pool = db::connect_and_migrate(&cfg.database_url).await?;
     let petro = PetroClient::new(&cfg)?;
@@ -56,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
+            // 5xx only. A client sending a bad request is not a bug in this
+            // service, and 4xx volume would bury the ones that are. Everything
+            // attached here passes through `observability`'s scrubber first.
+            .wrap(sentry_actix::Sentry::builder().capture_server_errors(true).finish())
             .configure(api::configure)
     })
     .bind(&bind_addr)?
