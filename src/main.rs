@@ -64,7 +64,14 @@ async fn main() -> anyhow::Result<()> {
             // 5xx only. A client sending a bad request is not a bug in this
             // service, and 4xx volume would bury the ones that are. Everything
             // attached here passes through `observability`'s scrubber first.
-            .wrap(sentry_actix::Sentry::builder().capture_server_errors(true).finish())
+            .wrap(
+                sentry_actix::Sentry::builder()
+                    .capture_server_errors(true)
+                    // Transactions, so upstream latency and throughput are
+                    // visible and not just outright failures.
+                    .start_transaction(true)
+                    .finish(),
+            )
             .configure(api::configure)
     })
     .bind(&bind_addr)?

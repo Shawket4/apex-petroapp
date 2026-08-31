@@ -170,6 +170,20 @@ impl From<sqlx::Error> for SyncError {
 }
 impl From<PetroError> for SyncError {
     fn from(e: PetroError) -> Self {
+        // Report here, because this is the one place every upstream failure
+        // passes through, and it is reached only once the client has exhausted
+        // its retries. A throttle or blip that the retry loop absorbs stays
+        // quiet; a PetroApp outage that actually stops a sync becomes an event.
+        //
+        // Without this the failures were invisible: the service handles them
+        // and returns something sensible, so no HTTP middleware ever sees them.
+        let operation = match &e {
+            PetroError::Auth => "auth",
+            PetroError::Request(_) => "request",
+            PetroError::Payload(_) => "payload",
+        };
+        crate::observability::capture_upstream_failure("petroapp", operation, None, &e);
+
         match e {
             PetroError::Auth => SyncError::Auth,
             other => SyncError::Other(other.to_string()),
