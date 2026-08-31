@@ -27,12 +27,25 @@ pub struct AppState {
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Registry rather than fmt(), so the Sentry layer can carry a filter of its
+    // own. The console keeps sqlx=warn — query logs would drown it — while
+    // Sentry sees sqlx at debug, which is what puts the last queries and their
+    // elapsed times on an error event.
+    {
+        use tracing_subscriber::prelude::*;
+        let console = tracing_subscriber::fmt::layer().with_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,sqlx=warn".into()),
-        )
-        .init();
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sqlx=warn")),
+        );
+        let sentry_layer = sentry_tracing::layer().with_filter(
+            tracing_subscriber::EnvFilter::try_from_env("SENTRY_TRACING_FILTER")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sqlx=debug")),
+        );
+        tracing_subscriber::registry()
+            .with(sentry_layer)
+            .with(console)
+            .init();
+    }
 
     // Sentry, if SENTRY_DSN is set. The guard must outlive the server; with no
     // DSN this is None and the service runs exactly as it did before.
