@@ -64,7 +64,15 @@ impl actix_web::ResponseError for ApiError {
         // the endpoint, so a 5xx answers with its shape and nothing else. The
         // 4xx messages are ours and are written to be read by the dashboard.
         let detail = if status.is_server_error() {
-            tracing::error!(error = %self, "api error");
+            // This is the line that reaches Sentry, via sentry-tracing. Db and
+            // Other are #[error(transparent)], so it is the raw sqlx or anyhow
+            // message; the scrubber redacts by key and cannot clean free text,
+            // so it is sanitized on the way out. Compliance control — do not
+            // log `%self` here raw.
+            tracing::error!(
+                error = %crate::observability::sanitize_message(&self.to_string()),
+                "api error"
+            );
             "internal server error".to_string()
         } else {
             self.to_string()
