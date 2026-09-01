@@ -54,11 +54,58 @@ impl actix_web::ResponseError for ApiError {
     }
 
     fn error_response(&self) -> HttpResponse {
+        let status = self.status_code();
+
         // Log full detail server-side, return a clean shape to the caller.
-        if self.status_code().is_server_error() {
+        //
+        // Db and Other are #[error(transparent)], so `to_string()` is the raw
+        // sqlx or anyhow message — which names tables, columns, the host and
+        // the role. That is detail for the operator, not for whoever called
+        // the endpoint, so a 5xx answers with its shape and nothing else. The
+        // 4xx messages are ours and are written to be read by the dashboard.
+        let detail = if status.is_server_error() {
             tracing::error!(error = %self, "api error");
-        }
-        HttpResponse::build(self.status_code())
-            .json(json!({ "error": self.to_string() }))
+            "internal server error".to_string()
+        } else {
+            self.to_string()
+        };
+
+        HttpResponse::build(status).json(json!({ "error": detail }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::ResponseError;
+
+    /// The client gets the shape; the operator log gets the detail. sqlx
+    /// messages name the host, the role and the columns, and this response
+    /// goes to anyone who can reach the endpoint.
+    #[actix_web::test]
+    async fn server_errors_do_not_describe_themselves_to_the_caller() {
+        let err = ApiError::Other(anyhow::anyhow!("relation \"petroapp_bills\" does not exist"));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.to_string().contains("petroapp_bills"), "precondition");
+
+        let resp = err.error_response();
+        let bytes = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("petroapp_bills"), "leaked schema to the caller: {body}");
+        assert!(body.contains("internal server error"), "unhelpful shape: {body}");
+    }
+
+    /// Client errors keep their messages: the dashboard reads them.
+    #[test]
+    fn client_errors_keep_their_message() {
+        assert_eq!(ApiError::NotFound.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            ApiError::NoCredentials.status_code(),
+            StatusCode::FAILED_DEPENDENCY,
+        );
+        assert_eq!(
+            ApiError::Petro(PetroError::Auth).status_code(),
+            StatusCode::FAILED_DEPENDENCY,
+        );
     }
 }
