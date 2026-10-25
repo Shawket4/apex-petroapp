@@ -43,7 +43,12 @@ jobs:
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # x86-64-v4 (AVX-512): the VPS is an AMD EPYC 9354P (checked 2026-10-25,
+      # `ld.so --help` lists v4 as supported). The explicit --target keeps these
+      # flags off build scripts and proc macros, which run on the CI machine.
       - name: Build (release, static)
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v4"
         run: cargo build --release --target "${TARGET}"
 
       - name: Verify the binary is static
